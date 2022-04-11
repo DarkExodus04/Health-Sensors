@@ -1,13 +1,15 @@
+#include <WiFi.h>
 #include <CircularBuffer.h>
-#include <MAX30100.h>
-#include <MAX30100_BeatDetector.h>
-#include <MAX30100_Filters.h>
-#include <MAX30100_PulseOximeter.h>
-#include <MAX30100_Registers.h>
-#include <MAX30100_SpO2Calculator.h>
+//#include <MAX30100.h>
+//#include <MAX30100_BeatDetector.h>
+//#include <MAX30100_Filters.h>
+//#include <MAX30100_PulseOximeter.h>
+//#include <MAX30100_Registers.h>
+//#include <MAX30100_SpO2Calculator.h>
+#include "MAX30105.h"
+#include "spo2_algorithm.h"
 #include <Wire.h>
 #include <ArduinoJson.h>
-#include <WiFi.h>
 #include "secrets.h"
 #include <HTTPClient.h>
 
@@ -21,20 +23,21 @@
 #define ECG A0
 #define temp 34
 #define REPORTING_PERIOD_MS 1000
- 
+MAX30105 particleSensor;
+#define MAX_BRIGHTNESS 255 
 /****************************************
  * Auxiliar Functions
  ****************************************/
-float BPM, SpO2;
+float BPM;
 uint32_t tsLastReport = 0;
 StaticJsonDocument<500> doc;
-PulseOximeter pox;
-
-void onBeatDetected()
-{
-    Serial.println("Beat Detected!");
-}
- 
+int32_t bufferLength; //data length
+uint32_t irBuffer[100]; //infrared LED sensor data
+uint32_t redBuffer[100];  //red LED sensor data
+int32_t spo2; //SPO2 value
+int8_t validSPO2; //indicator to show if the SPO2 calculation is valid
+int32_t heartRate; //heart rate value
+int8_t validHeartRate;
 /****************************************
  * Main Functions
  ****************************************/
@@ -45,47 +48,99 @@ void setup() {
   pinMode(ECG, INPUT);
   pinMode(temp, INPUT);
   //Oximeter
-  Serial.print("Initializing Pulse Oximeter..");
- 
-//    if (!pox.begin())
-//    {
-//         Serial.println("FAILED");
-//         for(;;);
-//    }
-//    else
-//    {
-//         Serial.println("SUCCESS");
-//         pox.setOnBeatDetectedCallback(onBeatDetected);
-//    }
+  // Initialize sensor
+  if (!particleSensor.begin(Wire, I2C_SPEED_FAST)) //Use default I2C port, 400kHz speed
+  {
+    Serial.println(F("MAX30105 was not found. Please check wiring/power."));
+    while (1);
+  }
+  byte ledBrightness = 60; //Options: 0=Off to 255=50mA
+  byte sampleAverage = 4; //Options: 1, 2, 4, 8, 16, 32
+  byte ledMode = 2; //Options: 1 = Red only, 2 = Red + IR, 3 = Red + IR + Green
+  byte sampleRate = 100; //Options: 50, 100, 200, 400, 800, 1000, 1600, 3200
+  int pulseWidth = 411; //Options: 69, 118, 215, 411
+  int adcRange = 4096; //Options: 2048, 4096, 8192, 16384
+
+  particleSensor.setup(ledBrightness, sampleAverage, ledMode, sampleRate, pulseWidth, adcRange); //Configure sensor with these settings
 }
  
 void loop() {
-//  pox.update();
-  float Ecg = analogRead(ECG);
-  float Temp = analogRead(temp);
-  BPM = pox.getHeartRate();
-//  SpO2 = pox.getSpO2();
-  SpO2 = 32.23;
-  if (millis() - tsLastReport > REPORTING_PERIOD_MS)
+
+bufferLength = 100; //buffer length of 100 stores 4 seconds of samples running at 25sps
+
+  //read the first 100 samples, and determine the signal range
+  for (byte i = 0 ; i < bufferLength ; i++)
+  {
+    while (particleSensor.available() == false) //do we have new data?
+      particleSensor.check(); //Check the sensor for new data
+
+    redBuffer[i] = particleSensor.getRed();
+    irBuffer[i] = particleSensor.getIR();
+    particleSensor.nextSample(); //We're finished with this sample so move to next sample
+  }
+
+  //calculate heart rate and SpO2 after first 100 samples (first 4 seconds of samples)
+  maxim_heart_rate_and_oxygen_saturation(irBuffer, bufferLength, redBuffer, &spo2, &validSPO2, &heartRate, &validHeartRate);
+
+  //Continuously taking samples from MAX30102.  Heart rate and SpO2 are calculated every 1 second
+  while (1)
+  {
+    //dumping the first 25 sets of samples in the memory and shift the last 75 sets of samples to the top
+    for (byte i = 25; i < 100; i++)
     {
-        Serial.print("Heart rate:");
-        Serial.println(BPM);
-        doc["sensors"]["Heartrate"] = BPM;
-        Serial.print(" SpO2:");
-        Serial.print(SpO2);
-        doc["sensors"]["Oxygen"] = SpO2;
-        Serial.println(" %");
-        tsLastReport = millis();
-        Serial.print("ECG value");
-        doc["sensors"]["ECG"] = ECG;
-        Serial.println(Ecg);
-        Serial.print("Temperature");
-        Serial.println(Temp);
-        doc["sensors"]["Temperature"] = Temp;
-//        POSTData();
+      redBuffer[i - 25] = redBuffer[i];
+      irBuffer[i - 25] = irBuffer[i];
     }
+
+    //take 25 sets of samples before calculating the heart rate.
+    for (byte i = 75; i < 100; i++)
+    {
+      while (particleSensor.available() == false) //do we have new data?
+        particleSensor.check(); //Check the sensor for new data
+        
+      redBuffer[i] = particleSensor.getRed();
+      irBuffer[i] = particleSensor.getIR();
+      particleSensor.nextSample();
+
+      Serial.print(F(", HR="));
+      Serial.print(heartRate, DEC);
+
+      Serial.print(F(", HRvalid="));
+      Serial.print(validHeartRate, DEC);
+
+      Serial.print(F(", SPO2="));
+      Serial.print(spo2, DEC);
+
+      Serial.print(F(", SPO2Valid="));
+      Serial.println(validSPO2, DEC);
+    }
+
+    float Ecg = analogRead(ECG);
+    float Temp = analogRead(temp);
+    if (millis() - tsLastReport > REPORTING_PERIOD_MS)
+      {
+          Serial.print("Heart rate:");
+          Serial.println(heartRate);
+          doc["sensors"]["Heartrate"] = heartRate;
+          Serial.print(" SpO2:");
+          Serial.print(spo2);
+          doc["sensors"]["Oxygen"] = spo2;
+          Serial.println(" %");
+          tsLastReport = millis();
+          Serial.print("ECG value");
+          doc["sensors"]["ECG"] = ECG;
+          Serial.println(Ecg);
+          Serial.print("Temperature");
+          Serial.println(Temp);
+          doc["sensors"]["Temperature"] = Temp;
+  //        POSTData();
+      }
+//After gathering 25 new samples recalculate HR and SP02
+    maxim_heart_rate_and_oxygen_saturation(irBuffer, bufferLength, redBuffer, &spo2, &validSPO2, &heartRate, &validHeartRate);
   
   delay(3000);
+  }
+
 }
 
 
