@@ -1,13 +1,8 @@
+#include <heartRate.h>
+#include <MAX30105.h>
+#include <spo2_algorithm.h>
 #include <WiFi.h>
 #include <CircularBuffer.h>
-//#include <MAX30100.h>
-//#include <MAX30100_BeatDetector.h>
-//#include <MAX30100_Filters.h>
-//#include <MAX30100_PulseOximeter.h>
-//#include <MAX30100_Registers.h>
-//#include <MAX30100_SpO2Calculator.h>
-#include "MAX30105.h"
-#include "spo2_algorithm.h"
 #include <Wire.h>
 #include <ArduinoJson.h>
 #include "secrets.h"
@@ -23,6 +18,9 @@
 #define ECG A0
 #define temp 34
 #define REPORTING_PERIOD_MS 1000
+#define ADC_VREF_mV    3300.0 // in millivolt
+#define ADC_RESOLUTION 4096.0
+
 MAX30105 particleSensor;
 #define MAX_BRIGHTNESS 255 
 /****************************************
@@ -38,6 +36,7 @@ int32_t spo2; //SPO2 value
 int8_t validSPO2; //indicator to show if the SPO2 calculation is valid
 int32_t heartRate; //heart rate value
 int8_t validHeartRate;
+long unblockedValue;
 /****************************************
  * Main Functions
  ****************************************/
@@ -62,7 +61,15 @@ void setup() {
   int adcRange = 4096; //Options: 2048, 4096, 8192, 16384
 
   particleSensor.setup(ledBrightness, sampleAverage, ledMode, sampleRate, pulseWidth, adcRange); //Configure sensor with these settings
+
+  unblockedValue = 0;
+  for (byte x = 0 ; x < 32 ; x++)
+  {
+    unblockedValue += particleSensor.getIR(); //Read the IR value
+  }
+  unblockedValue /= 32;
 }
+
  
 void loop() {
 
@@ -101,50 +108,58 @@ bufferLength = 100; //buffer length of 100 stores 4 seconds of samples running a
       redBuffer[i] = particleSensor.getRed();
       irBuffer[i] = particleSensor.getIR();
       particleSensor.nextSample();
-
-      Serial.print(F(", HR="));
-      Serial.print(heartRate, DEC);
-
-      Serial.print(F(", HRvalid="));
-      Serial.print(validHeartRate, DEC);
-
-      Serial.print(F(", SPO2="));
-      Serial.print(spo2, DEC);
-
-      Serial.print(F(", SPO2Valid="));
-      Serial.println(validSPO2, DEC);
     }
 
+      // read the ADC value from the temperature sensor
+    int adcVal = analogRead(temp);
+    // convert the ADC value to voltage in millivolt
+    float milliVolt = adcVal * (ADC_VREF_mV / ADC_RESOLUTION);
+
+    // convert the voltage to the temperature in °C
+    float tempC = milliVolt / 10;
+
+    // convert the °C to °F
     float Ecg = analogRead(ECG);
-    float Temp = analogRead(temp);
+    
+//    long currentDelta = particleSensor.getIR() - unblockedValue;
+//    if (currentDelta > (long)100)
+//  {
+//    heartRate = random(75,90);
+//    spo2 = random(93,99);
+//    tempC = random(26,32);
+//  }
+//  else
+//  {
+//    heartRate = 0;
+//    spo2 = 0;
+//    tempC = random(26,32);
+//  }
+    
     if (millis() - tsLastReport > REPORTING_PERIOD_MS)
       {
-          Serial.print("Heart rate:");
+          Serial.print("Heart rate: ");
           Serial.println(heartRate);
           doc["sensors"]["Heartrate"] = heartRate;
-          Serial.print(" SpO2:");
+          Serial.print(" SpO2: ");
           Serial.print(spo2);
           doc["sensors"]["Oxygen"] = spo2;
           Serial.println(" %");
           tsLastReport = millis();
-          Serial.print("ECG value");
+          Serial.print("ECG value: ");
           doc["sensors"]["ECG"] = ECG;
           Serial.println(Ecg);
-          Serial.print("Temperature");
-          Serial.println(Temp);
-          doc["sensors"]["Temperature"] = Temp;
+          Serial.print("Temperature: ");
+          Serial.println(tempC);
+          doc["sensors"]["Temperature"] = tempC;
   //        POSTData();
       }
 //After gathering 25 new samples recalculate HR and SP02
     maxim_heart_rate_and_oxygen_saturation(irBuffer, bufferLength, redBuffer, &spo2, &validSPO2, &heartRate, &validHeartRate);
-  
-  delay(3000);
+  delay(2000);
   }
 
 }
 
-
-//
 //void POSTData()
 //{
 //      
